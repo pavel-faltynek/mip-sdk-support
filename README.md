@@ -47,7 +47,7 @@ Problems in the MIP SDK:
 - According to 6.vi
     - Every time the superblock gets decrypted, initialization vector (IV) must be computed, unfortunately, it is computed in wrong way.
     - Accidentally, the first block IV is correct, as the method actually used has the same result as the method which should be used for input of 0.
-    - The IV SHOULD get computed as `AES128ECB.Encrypt(superblock_offset, key)`, but it's probably computed as `AES128ECB.Encrypt(superblock_number, key)` or any other way, because trying to pass `4096 * superblock_offset` still does not correct the output.
+    - The IV SHOULD get computed as `AES128ECB.Encrypt(superblock_offset, key)`, but it's ~~probably~~ computed as `AES128ECB.Encrypt(superblock_number, key)` **TO BE CLARIFIED:** _or any other way, because trying to pass `4096 * superblock_offset` still does not correct the output._
 - According to 6.vii, I'm not sure, but I can probably live with it now (not sure, if this doesn't turn into bigger problem during encryption phase).
 
 Resolution:

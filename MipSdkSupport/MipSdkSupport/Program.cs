@@ -179,6 +179,15 @@ internal class Program
         {
             await file.WriteAsync(cleartextData.AsMemory(0, (int)cleartextLength));
         }
+
+        /*
+         * ================================================== Compute seeds used fo superblock IV calculation ==================================================
+         */
+        var ivValues = await AnalyzeOriginalIvValuesAsync(Inputs.HackDecryptionKey);
+        await using (var file = File.Open("08.InitVectorSeeds", FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
+        {
+            await DumpIvValuesAsync(file, ivValues);
+        }
     }
 
 
@@ -365,6 +374,106 @@ internal class Program
         outputStream.Position = 0;
 
         return outputStream;
+    }
+
+    private static async ValueTask<IReadOnlyCollection<(byte[] Correct, byte[] Incorrect)>> AnalyzeOriginalIvValuesAsync(byte[] key)
+    {
+        var result = new List<(byte[] Correct, byte[] Incorrect)>();
+
+        using var aes = BuildSimpleAes(key);
+
+        await using var cipherTextFile       = File.Open("02.ContentsEncrypted", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        await using var manualClearTextFile  = File.Open("03.ContentsDecryptedManually", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        await using var handlerClearTextFile = File.Open("07.ContentsDecryptedByHandler", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+
+        var block = new byte[16];
+        var offset = 0L;
+        while (offset < cipherTextFile.Length)
+        {
+            cipherTextFile.Position = manualClearTextFile.Position = handlerClearTextFile.Position = offset;
+
+            // Read first block of the superblock of the ciphertext
+            await cipherTextFile.ReadExactlyAsync(block, 0, block.Length);
+            var preIvClearText = DecryptBlock(aes, block);
+
+            // Read first block of the superblock of the cleartext (manually decrypted, thus correct)
+            await manualClearTextFile.ReadExactlyAsync(block, 0, block.Length);
+            var ivCorrect      = XorBlocks(preIvClearText, block);
+            var ivCorrectValue = DecryptBlock(aes, ivCorrect);
+
+            // Read first block of the superblock of the cleartext (handler decrypted, thus incorrect)
+            await handlerClearTextFile.ReadExactlyAsync(block, 0, block.Length);
+            var ivIncorrect      = XorBlocks(preIvClearText, block);
+            var ivIncorrectValue = DecryptBlock(aes, ivIncorrect);
+
+            result.Add((ivCorrectValue, ivIncorrectValue));
+
+            offset += 4096;
+        }
+
+        return result;
+    }
+
+    private static byte[] DecryptBlock(Aes aes, byte[] cipherText)
+    {
+        var clearText = new byte[16];
+        using var decryptor = aes.CreateDecryptor();
+        decryptor.TransformBlock(cipherText, 0, cipherText.Length, clearText, 0);
+
+        return clearText;
+    }
+
+    private static byte[] XorBlocks(byte[] block1, byte[] block2)
+    {
+        var length = Math.Max(block1.Length, block2.Length);
+        var xor = new byte[length];
+
+        for (var i = 0; i < length; ++i)
+        {
+            var b1 = i < block1.Length ? block1[i] : 0;
+            var b2 = i < block2.Length ? block2[i] : 0;
+            xor[i] = (byte)(b1 ^ b2);
+        }
+
+        return xor;
+    }
+
+    private static Aes BuildSimpleAes(byte[] key)
+    {
+        var aes = Aes.Create();
+
+        aes.Mode    = CipherMode.ECB;
+        aes.KeySize = key.Length * 8;
+        aes.Key     = key;
+        aes.IV      = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        aes.Padding = PaddingMode.None;
+
+        return aes;
+    }
+
+    private static bool TryGetUnsignedLongLe(byte[] data, out ulong? value)
+    {
+        value = null;
+        if (data.Length > 8 && data[8 ..].Any(d => d > 0)) return false;
+
+        value = BinaryPrimitives.ReadUInt64LittleEndian(data);
+        return true;
+    }
+
+    private static async ValueTask DumpIvValuesAsync(Stream file, IReadOnlyCollection<(byte[] Correct, byte[] Incorrect)> ivValues)
+    {
+        const string BiggerThan64Bits = "<more than 64 bits>";
+        await using var writer = new StreamWriter(file, leaveOpen: true);
+
+        await writer.WriteLineAsync("Correct\tIncorrect");
+        foreach (var (correct, incorrect) in ivValues)
+        {
+            var correctText   = TryGetUnsignedLongLe(correct  , out var correctValue  ) ? $"0x{correctValue:x16}"   : BiggerThan64Bits;
+            var incorrectText = TryGetUnsignedLongLe(incorrect, out var incorrectValue) ? $"0x{incorrectValue:x16}" : BiggerThan64Bits;
+
+            await writer.WriteLineAsync($"{correctText}\t{incorrectText}");
+        }
     }
 }
 
