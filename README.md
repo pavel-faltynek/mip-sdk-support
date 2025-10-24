@@ -47,7 +47,7 @@ Problems in the MIP SDK:
 - According to 6.vi
     - Every time the superblock gets decrypted, initialization vector (IV) must be computed, unfortunately, it is computed in wrong way.
     - Accidentally, the first block IV is correct, as the method actually used has the same result as the method which should be used for input of 0.
-    - The IV SHOULD get computed as `AES128ECB.Encrypt(superblock_offset, key)`, but it's ~~probably~~ computed as `AES128ECB.Encrypt(superblock_number, key)` **TO BE CLARIFIED:** _or any other way, because trying to pass `4096 * superblock_offset` still does not correct the output._
+    - The IV SHOULD get computed as `AES128ECB.Encrypt(superblock_offset, key)`, but it's computed as `AES128ECB.Encrypt(superblock_number, key)`.
 - According to 6.vii, I'm not sure, but I can probably live with it now (not sure, if this doesn't turn into bigger problem during encryption phase).
 
 Resolution:
@@ -64,6 +64,13 @@ Proof for the resolution according to the 6.vi:
 - Manually decrypt the `DRMContent` per 4k blocks by `AES256CBC` using the extracted key.
 - Compute the IV for each block as described above (Problems in the MIP SDK).
 - Observe fully valid data (CFB with the protected content).
+
+Applicable workarounds:
+
+- According to 6.vi
+    - Decrypt content per superblocks.
+    - Pass the fake offset computed as offset * superblock-length.
+    - Hope there is no bit truncation on the passed value down the road and the encrypted data is relatively small (that 4096 x length doesn't overflow 32bit value).
 
 Notes:
 

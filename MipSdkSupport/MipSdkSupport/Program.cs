@@ -30,6 +30,9 @@ internal static class Inputs
 
 internal class Program
 {
+    private const int AesBlockSize   = 16;
+    private const int SuperblockSize = 4096;
+
     private static async Task Main(string[] args)
     {
         if (args.Length < 1) Environment.Exit(-1); // Expecting rpmsg file path as an argument
@@ -183,10 +186,32 @@ internal class Program
         /*
          * ================================================== Compute seeds used fo superblock IV calculation ==================================================
          */
-        var ivValues = await AnalyzeOriginalIvValuesAsync(Inputs.HackDecryptionKey);
+        var ivValues = await AnalyzeOriginalIvValuesAsync(Inputs.HackDecryptionKey, "02.ContentsEncrypted", "03.ContentsDecryptedManually", "07.ContentsDecryptedByHandler");
         await using (var file = File.Open("08.InitVectorSeeds", FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
         {
             await DumpIvValuesAsync(file, ivValues);
+        }
+
+        /*
+         * ================================================== Decrypt using MIP consumption protection handler, but try to compensate the incorrect IV calculation for superblocks (handlers read) ==================================================
+         */
+        var ciphertextBlock = new byte[SuperblockSize]; // Should correspond to consumptionHandler.BlockSize
+        var cleartextBlock  = new byte[SuperblockSize];
+        var offset          = 0L;
+
+        while (offset < contentsData.Length)
+        {
+            Buffer.BlockCopy(contentsData, (int)offset, ciphertextBlock, 0, SuperblockSize);
+
+            var fakeOffset = offset * SuperblockSize; // Compensate the incorrect IV calculation
+            _ = consumptionHandler.DecryptBuffer(fakeOffset, ciphertextBlock, cleartextBlock, false);
+
+            Buffer.BlockCopy(cleartextBlock, 0, cleartextData, (int)offset, SuperblockSize);
+            offset += SuperblockSize;
+        }
+        await using (var file = File.Open("09.ContentsDecryptedByHandlerCompensated", FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
+        {
+            await file.WriteAsync(cleartextData.AsMemory(0, (int)cleartextLength));
         }
     }
 
@@ -227,11 +252,11 @@ internal class Program
             aes.Key     = key;
             aes.Padding = PaddingMode.None;
 
-            var buffer = new byte[4096];
+            var buffer = new byte[SuperblockSize];
             var blockNumber = 0u;
             while (encrypted.Position < encrypted.Length)
             {
-                aes.IV = HackCalculateIv(blockNumber * 4096, key);
+                aes.IV = HackCalculateIv(blockNumber * SuperblockSize, key);
 
                 using var decryptor = aes.CreateDecryptor();
                 await using var cryptoStream = new CryptoStream(encrypted, decryptor, CryptoStreamMode.Read, leaveOpen: true);
@@ -251,8 +276,6 @@ internal class Program
 
     private static byte[] HackCalculateIv(uint blockOffset, byte[] key)
     {
-        const int AesBlockSize = 16;
-
         var iv = new byte[AesBlockSize];
         using var aes = Aes.Create();
 
@@ -376,40 +399,41 @@ internal class Program
         return outputStream;
     }
 
-    private static async ValueTask<IReadOnlyCollection<(byte[] Correct, byte[] Incorrect)>> AnalyzeOriginalIvValuesAsync(byte[] key)
+    private static async ValueTask<IReadOnlyCollection<(byte[] Correct, byte[] Incorrect)>> AnalyzeOriginalIvValuesAsync(byte[] key, string ciphertextFilename, string manualCleartextFilename, string handlerCleartextFilename)
     {
         var result = new List<(byte[] Correct, byte[] Incorrect)>();
 
         using var aes = BuildSimpleAes(key);
 
-        await using var cipherTextFile       = File.Open("02.ContentsEncrypted", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        await using var manualClearTextFile  = File.Open("03.ContentsDecryptedManually", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        await using var handlerClearTextFile = File.Open("07.ContentsDecryptedByHandler", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        await using var ciphertextFile       = File.Open(ciphertextFilename      , FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        await using var manualCleartextFile  = File.Open(manualCleartextFilename , FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        await using var handlerCleartextFile = File.Open(handlerCleartextFilename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
 
 
-        var block = new byte[16];
+        var block  = new byte[AesBlockSize];
         var offset = 0L;
-        while (offset < cipherTextFile.Length)
+
+        while (offset < ciphertextFile.Length)
         {
-            cipherTextFile.Position = manualClearTextFile.Position = handlerClearTextFile.Position = offset;
+            ciphertextFile.Position = manualCleartextFile.Position = handlerCleartextFile.Position = offset;
 
             // Read first block of the superblock of the ciphertext
-            await cipherTextFile.ReadExactlyAsync(block, 0, block.Length);
-            var preIvClearText = DecryptBlock(aes, block);
+            await ciphertextFile.ReadExactlyAsync(block, 0, block.Length);
+            var preIvCleartext = DecryptBlock(aes, block);
 
             // Read first block of the superblock of the cleartext (manually decrypted, thus correct)
-            await manualClearTextFile.ReadExactlyAsync(block, 0, block.Length);
-            var ivCorrect      = XorBlocks(preIvClearText, block);
-            var ivCorrectValue = DecryptBlock(aes, ivCorrect);
+            await manualCleartextFile.ReadExactlyAsync(block, 0, block.Length);
+            var ivCorrect     = XorBlocks(preIvCleartext, block);
+            var ivCorrectSeed = DecryptBlock(aes, ivCorrect);
 
             // Read first block of the superblock of the cleartext (handler decrypted, thus incorrect)
-            await handlerClearTextFile.ReadExactlyAsync(block, 0, block.Length);
-            var ivIncorrect      = XorBlocks(preIvClearText, block);
-            var ivIncorrectValue = DecryptBlock(aes, ivIncorrect);
+            await handlerCleartextFile.ReadExactlyAsync(block, 0, block.Length);
+            var ivIncorrect     = XorBlocks(preIvCleartext, block);
+            var ivIncorrectSeed = DecryptBlock(aes, ivIncorrect);
 
-            result.Add((ivCorrectValue, ivIncorrectValue));
+            result.Add((ivCorrectSeed, ivIncorrectSeed));
 
-            offset += 4096;
+            offset += SuperblockSize;
         }
 
         return result;
@@ -417,7 +441,7 @@ internal class Program
 
     private static byte[] DecryptBlock(Aes aes, byte[] cipherText)
     {
-        var clearText = new byte[16];
+        var clearText = new byte[AesBlockSize];
         using var decryptor = aes.CreateDecryptor();
         decryptor.TransformBlock(cipherText, 0, cipherText.Length, clearText, 0);
 
