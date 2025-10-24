@@ -195,23 +195,36 @@ internal class Program
         /*
          * ================================================== Decrypt using MIP consumption protection handler, but try to compensate the incorrect IV calculation for superblocks (handlers read) ==================================================
          */
-        var ciphertextBlock = new byte[SuperblockSize]; // Should correspond to consumptionHandler.BlockSize
-        var cleartextBlock  = new byte[SuperblockSize];
-        var offset          = 0L;
-
-        while (offset < contentsData.Length)
-        {
-            Buffer.BlockCopy(contentsData, (int)offset, ciphertextBlock, 0, SuperblockSize);
-
-            var fakeOffset = offset * SuperblockSize; // Compensate the incorrect IV calculation
-            _ = consumptionHandler.DecryptBuffer(fakeOffset, ciphertextBlock, cleartextBlock, false);
-
-            Buffer.BlockCopy(cleartextBlock, 0, cleartextData, (int)offset, SuperblockSize);
-            offset += SuperblockSize;
-        }
+        DecryptPerSuperblockByHandler(consumptionHandler, contentsData, cleartextData);
         await using (var file = File.Open("09.ContentsDecryptedByHandlerCompensated", FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
         {
             await file.WriteAsync(cleartextData.AsMemory(0, (int)cleartextLength));
+        }
+
+
+        /*
+         * ================================================== Encrypt using MIP consumption protection handler, mess gets produced after first superblock. (handlers write) ==================================================
+         * TBD: Is the handler the same as publishing handler?
+         */
+        var ciphertextData = new byte[cleartextData.Length];
+        _ = consumptionHandler.EncryptBuffer(0, cleartextData, ciphertextData, false); // Following exception for isFinal == true might still make sense, as the data is aligned on 4k
+        // Microsoft.InformationProtection.Exceptions.BadInputException: 'Cbc4kCryptoProvider: Invalid buffer size, BadInputError.Code=General'
+
+        await using (var file = File.Open("10.ContentsEncryptedByHandler", FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
+        {
+            await file.WriteAsync(ciphertextData);
+        }
+
+        for (var i = 0; i < ciphertextData.Length; ++i) ciphertextData[i] = (byte)i;
+
+        /*
+         * ================================================== Encrypt using MIP consumption protection handler, reuse the IV pattern from decryption and produce valid content. (handlers write) ==================================================
+         * TBD: Is the handler the same as publishing handler?
+         */
+        EncryptPerSuperblockByHandler(consumptionHandler, cleartextData, ciphertextData);
+        await using (var file = File.Open("11.ContentsEncryptedByHandlerCompensated", FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite))
+        {
+            await file.WriteAsync(ciphertextData);
         }
     }
 
@@ -277,13 +290,7 @@ internal class Program
     private static byte[] HackCalculateIv(uint blockOffset, byte[] key)
     {
         var iv = new byte[AesBlockSize];
-        using var aes = Aes.Create();
-
-        aes.Mode    = CipherMode.ECB;
-        aes.KeySize = key.Length * 8;
-        aes.Key     = key;
-        aes.IV      = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        aes.Padding = PaddingMode.None;
+        using var aes = BuildSimpleAes(key);
 
         var blockOffsetInput = new byte[AesBlockSize];
         BinaryPrimitives.WriteUInt32LittleEndian(blockOffsetInput, blockOffset);
@@ -497,6 +504,42 @@ internal class Program
             var incorrectText = TryGetUnsignedLongLe(incorrect, out var incorrectValue) ? $"0x{incorrectValue:x16}" : BiggerThan64Bits;
 
             await writer.WriteLineAsync($"{correctText}\t{incorrectText}");
+        }
+    }
+
+    private static void DecryptPerSuperblockByHandler(IProtectionHandler handler, byte[] ciphertextData, byte[] cleartextData)
+    {
+        var ciphertextBlock = new byte[SuperblockSize]; // Should correspond to handler.BlockSize
+        var cleartextBlock  = new byte[SuperblockSize];
+
+        var offset = 0L;
+        while (offset < ciphertextData.Length)
+        {
+            Buffer.BlockCopy(ciphertextData, (int)offset, ciphertextBlock, 0, SuperblockSize);
+
+            var fakeOffset = offset * SuperblockSize; // Compensate the incorrect IV calculation
+            _ = handler.DecryptBuffer(fakeOffset, ciphertextBlock, cleartextBlock, false);
+
+            Buffer.BlockCopy(cleartextBlock, 0, cleartextData, (int)offset, SuperblockSize);
+            offset += SuperblockSize;
+        }
+    }
+
+    private static void EncryptPerSuperblockByHandler(IProtectionHandler handler, byte[] cleartextData, byte[] ciphertextData)
+    {
+        var ciphertextBlock = new byte[SuperblockSize]; // Should correspond to handler.BlockSize
+        var cleartextBlock  = new byte[SuperblockSize];
+
+        var offset = 0L;
+        while (offset < cleartextData.Length)
+        {
+            Buffer.BlockCopy(cleartextData, (int)offset, cleartextBlock, 0, SuperblockSize);
+
+            var fakeOffset = offset * SuperblockSize; // Compensate the incorrect IV calculation
+            _ = handler.EncryptBuffer(fakeOffset, cleartextBlock, ciphertextBlock, false);
+
+            Buffer.BlockCopy(ciphertextBlock, 0, ciphertextData, (int)offset, SuperblockSize);
+            offset += SuperblockSize;
         }
     }
 }

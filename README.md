@@ -1,6 +1,7 @@
 Problem 1:
 
 - `IProtectionHandler.DecryptBuffer()` does not work correctly.
+- `IProtectionHandler.EncryptBuffer()` does not work correctly.
 
 Problem 2:
 
@@ -32,6 +33,7 @@ General reproduction steps:
     5. Extract the `DRMContent` stream from the `rpmsg` CFB (after its inflation).
     6. Decrypt the `DRMContent` stream via `IProtectionHandler.DecryptBuffer()`.
     7. Try to pass `true` to `isFinal` for the last block (or for the whole stream, if passing as a whole) during the `DRMContent` stream decryption via `IProtectionHandler.DecryptBuffer()`.
+    8. Workaround the decryption issues and Re-Encrypt the cleartext back using the `IProtectionHandler.EncryptBuffer()`.
 
 Actual results:
 
@@ -39,7 +41,8 @@ Actual results:
 - According to 6.vi:
     - Observe the produced clear text stream "seems" to be correct, but double-check it isn't.
     - At the beginnings of "superblocks" (4k blocks) there is always 16 corrupted bytes (except the first superblock).
-- According to 6.vii: exception is thrown (`Microsoft.InformationProtection.Exceptions.InternalException: 'AESCryptoWriter: Failed to transform final block'`).
+- According to 6.vii, exception is thrown (`Microsoft.InformationProtection.Exceptions.InternalException: 'AESCryptoWriter: Failed to transform final block'`).
+- According to 6.viii, the output suffers the same symptoms as for decryption phase.
 
 Problems in the MIP SDK:
 
@@ -49,6 +52,7 @@ Problems in the MIP SDK:
     - Accidentally, the first block IV is correct, as the method actually used has the same result as the method which should be used for input of 0.
     - The IV SHOULD get computed as `AES128ECB.Encrypt(superblock_offset, key)`, but it's computed as `AES128ECB.Encrypt(superblock_number, key)`.
 - According to 6.vii, I'm not sure, but I can probably live with it now (not sure, if this doesn't turn into bigger problem during encryption phase).
+- According to 6.viii, IV is also calculated from the `superblock_number`, instead of `superblock_offset`
 
 Resolution:
 
@@ -57,20 +61,26 @@ Resolution:
     - Use the same IV calculation as is already used in `IFileHandler.GetDecryptedTemporaryStreamAsync()` internally - because it's just able to decrypt the `rpmsg` with no problem.
     - Check also the `EncryptBuffer` function, where the same problem might be located too.
 - According to 6.vii, not sure.
+- According to 6.viii, use the correct IV calculation.
 
-Proof for the resolution according to the 6.vi:
+Proof for the resolution:
 
-- Extract the decryption key for the appropriate file/user/tenant from the MIP SDK sqlite file cache.
-- Manually decrypt the `DRMContent` per 4k blocks by `AES256CBC` using the extracted key.
-- Compute the IV for each block as described above (Problems in the MIP SDK).
-- Observe fully valid data (CFB with the protected content).
+- According to the 6.vi:
+    - Extract the decryption key for the appropriate file/user/tenant from the MIP SDK sqlite file cache.
+    - Manually decrypt the `DRMContent` per 4k blocks by `AES256CBC` using the extracted key.
+    - Compute the IV for each block as described above (Problems in the MIP SDK).
+    - Observe fully valid data (CFB with the protected content).
+- According to the 6.viii:
+    - When working around the IV calculation, Enc(Dec(data)) == data.
 
 Applicable workarounds:
 
 - According to 6.vi
     - Decrypt content per superblocks.
     - Pass the fake offset computed as offset * superblock-length.
-    - Hope there is no bit truncation on the passed value down the road and the encrypted data is relatively small (that 4096 x length doesn't overflow 32bit value).
+- According to 6.viii
+    - Encrypt content per superblocks.
+    - Pass the fake offset computed as offset * superblock-length.
 
 Notes:
 
